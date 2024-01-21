@@ -1,0 +1,171 @@
+# 原模型
+# https://www.kaggle.com/code/michaelnaples/sentiment-analysis-with-an-lstm-rnn-97-accuracy/notebook
+# 导入所需的库
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+from torch.utils.data import DataLoader, Dataset, random_split
+import numpy as np
+import pandas as pd
+from sklearn.utils import shuffle
+import pickle
+
+# 从CSV文件中读取数据
+df_depression = pd.read_csv('../content/depression_dataset_reddit_cleaned.csv')
+df_depression.head()
+
+# 提取文本数据和标签，并随机打乱数据
+data = [x for x in df_depression['clean_text']]
+labels = [x for x in df_depression['is_depression']]
+# data, labels = shuffle(data, labels)
+
+# 加载嵌入（Embeddings）文本
+embeddings_text = open('../content/glove.6B.300d.txt', 'r', encoding='utf-8')
+
+# 统计数据集中的单词
+words = {}
+for example in data:
+    for word in example.split():
+        if word not in words:
+            words[word] = 0
+        else:
+            words[word] += 1
+
+# 读取嵌入文本中的单词和对应的嵌入向量
+embs = {}
+for line in embeddings_text:
+    split = line.split()
+    word = split[0]
+    if word in words:
+        try:
+            embedding = np.array([float(value) for value in split[1:]])
+            embs[word] = embedding
+        except:
+            print('error loading embedding')
+
+embedding_matrix = []
+idx_to_word = []
+word_to_idx = {}
+embedding_matrix.append(np.zeros(300)) # 用于神经网络的零填充
+idx_to_word.append('')
+word_to_idx[''] = 0
+for i, (word, emb) in enumerate(embs.items()):
+    embedding_matrix.append(emb)
+    idx_to_word.append(word)
+    word_to_idx[word] = i + 1
+embedding_matrix = np.asarray(embedding_matrix)
+
+
+
+x_train = []
+for example in data:
+    temp = []
+    for word in example.split():
+        if word in word_to_idx:
+            temp.append(word_to_idx[word])
+    x_train.append(temp)
+x_train = np.asarray(x_train)
+for i in range(len(x_train)):
+    x_train[i] = x_train[i][:200]
+for i in range(len(x_train)):
+    x_train[i] = np.pad(x_train[i], (200 - len(x_train[i]), 0), 'constant')
+x_train_data = []
+for x in x_train:
+    x_train_data.append([k for k in x])
+x_train_data = np.array(x_train_data)
+
+
+
+# 创建RNN模型类
+class RNN(nn.Module):
+    def __init__(self, embeddings, LSTM_dim, n_layers, bidirectional):
+        super().__init__()
+
+        self.embedding = nn.Embedding(embeddings.shape[0], embeddings.shape[1])
+        self.embedding.load_state_dict({'weight': embeddings})
+        self.embedding.weight.requires_grad = False
+        self.lstm = nn.LSTM(embeddings.shape[1], LSTM_dim, num_layers=n_layers, bidirectional=bidirectional)
+        self.fc = nn.Linear(LSTM_dim, 1)
+        self.dropout = nn.Dropout(0.2)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input_x):
+        embedded = self.embedding(input_x.permute(1,0))
+        output, (hidden, cell) = self.lstm(embedded)
+        output = self.dropout(hidden[-1])
+        output = self.fc(output)
+        output = self.sigmoid(output)
+        return output
+
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model = RNN(torch.tensor(embedding_matrix), 128, 1, False).to(device)
+batch_size = 128
+criterion = nn.BCELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+
+
+class CustomImageDataset(Dataset):
+    def __init__(self, examples, labels):
+        self.examples = examples
+        self.labels = labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        example = torch.IntTensor(self.examples[idx])
+        label = self.labels[idx]
+
+        return example, label
+
+
+
+# 将数据集拆分为训练集和测试集
+dataset = CustomImageDataset(x_train_data, labels)
+train_length = int(len(dataset) * 0.8)
+test_length = len(dataset) - train_length
+x_dataset, y_dataset = random_split(dataset, [train_length, test_length])
+x_train_dataloader = DataLoader(x_dataset, batch_size=batch_size, shuffle=False)
+y_test_dataloader = DataLoader(y_dataset, batch_size=batch_size, shuffle=False)
+
+# 训练模型
+def train(epochs):
+    for epoch in range(epochs):
+        for i, (batch, labels) in enumerate(x_train_dataloader):
+            batch, labels = batch.to(device), labels.to(device)
+            labels = labels.reshape((len(labels), 1))
+            labels = labels.float()
+
+            model.zero_grad()
+
+            output = model(batch)
+            loss = criterion(output, labels)
+
+            loss.backward()
+            optimizer.step()
+            if i == 0:
+              print(f'Epoch: {epoch+1}/{epochs} Loss: {loss}')
+
+# 打印训练和测试集的准确率
+def print_accuracy(dataloader):
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for messages, labels in dataloader:
+            messages = torch.tensor(messages).to(device)
+            outputs = model(messages)
+            outputs = outputs.detach().cpu().numpy()
+            labels = labels.detach().cpu().numpy()
+            outputs = outputs >= 0.5
+            labels = labels == 1.0
+            total += len(labels)
+            for i in range(len(labels)):
+                if labels[i] == outputs[i][0]:
+                    correct += 1
+    print(correct / total)
+# 执行训练和评估
+train(20)
+print_accuracy(x_train_dataloader)
+print_accuracy(y_test_dataloader)
